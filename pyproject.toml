@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyforecast"
+version = "0.1.0"
+description = "Desktop app: ingest Excel/CSV, detect shape+frequency, normalize to long, forecast with Prophet."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Macrev" }]
+
+# DEFAULT deps: keep lean + deterministic.
+dependencies = [
+  # Pin PySide6 to avoid pip resolver scanning many combos of shiboken6/addons/essentials.
+  "PySide6==6.7.2",
+
+  "python-dateutil>=2.9.0.post0",
+]
+
+[project.optional-dependencies]
+data = [
+  "polars>=0.20.30",
+  "duckdb>=1.0.0",
+]
+
+excel = [
+  "python-calamine>=0.2.0",
+]
+
+forecast = [
+  "prophet>=1.1.5",
+]
+
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.9",
+  
+  "mypy>=1.18",
+  "types-python-dateutil",
+]
+
+all = [
+  "pyforecast[data,excel,forecast]",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+fix = true
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+no_implicit_optional = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
