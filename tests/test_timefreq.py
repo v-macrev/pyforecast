@@ -22,8 +22,6 @@ def test_infer_weekly() -> None:
 
 
 def test_infer_monthly_approx() -> None:
-    # Use ~30-day steps as a proxy; real monthly series have jitter,
-    # but our heuristic should still classify as monthly.
     res = infer_frequency(_mk_dates(date(2024, 1, 1), 30, 20))
     assert res.frequency == TimeFrequency.MONTHLY
     assert res.confidence >= 0.6
@@ -44,9 +42,9 @@ def test_irregular_when_inconsistent() -> None:
     dates = [
         date(2024, 1, 1),
         date(2024, 1, 2),
-        date(2024, 1, 10),  # jump
+        date(2024, 1, 10),
         date(2024, 1, 11),
-        date(2024, 2, 20),  # jump
+        date(2024, 2, 20),
         date(2024, 2, 21),
     ]
     res = infer_frequency(dates)
