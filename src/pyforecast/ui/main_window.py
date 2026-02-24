@@ -9,14 +9,29 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QStatusBar,
     QVBoxLayout,
     QWidget,
 )
 
-from pyforecast.application.services import IngestService, IngestedData, ProfilingService
+from pyforecast.application.services import (
+    IngestService,
+    IngestedData,
+    ProfilingService,
+    TransformRequest,
+    transform_to_canonical_long,
+)
+from pyforecast.domain.errors import PyForecastError
 from pyforecast.infrastructure.logging import get_logger
-from pyforecast.ui.widgets import FilePickerButton, PreviewTable
+from pyforecast.ui.widgets import (
+    ColumnMapper,
+    ColumnMapping,
+    FilePickerButton,
+    KeyBuilder,
+    KeySelection,
+    PreviewTable,
+)
 
 log = get_logger(__name__)
 
@@ -38,10 +53,14 @@ class MainWindow(QMainWindow):
         )
 
         self.setWindowTitle("PyForecast")
-        self.setMinimumSize(980, 740)
+        self.setMinimumSize(980, 720)
 
-        root = QWidget(self)
-        self.setCentralWidget(root)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        self.setCentralWidget(scroll)
+
+        root = QWidget(scroll)
+        scroll.setWidget(root)
 
         layout = QVBoxLayout(root)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -65,8 +84,18 @@ class MainWindow(QMainWindow):
         self._profile_info.setWordWrap(True)
         self._profile_info.setStyleSheet("padding: 10px; border: 1px solid #eee; border-radius: 8px;")
 
+        self._transform_info = QLabel("Transform: (not run)")
+        self._transform_info.setWordWrap(True)
+        self._transform_info.setStyleSheet("padding: 10px; border: 1px solid #eee; border-radius: 8px;")
+
         self._preview = PreviewTable(self)
-        self._preview.setMinimumHeight(260)
+        self._preview.setMinimumHeight(240)
+
+        self._column_mapper = ColumnMapper(self)
+        self._column_mapper.mapping_changed.connect(self._on_mapping_changed)
+
+        self._key_builder = KeyBuilder(self)
+        self._key_builder.selection_changed.connect(self._on_key_selection_changed)
 
         self._ingest_service = IngestService(preview_n=200)
         self._profiling_service = ProfilingService(sample_limit=200)
@@ -74,9 +103,13 @@ class MainWindow(QMainWindow):
         self._file_picker = FilePickerButton(parent=self, ingest=self._ingest_service)
         self._file_picker.ingested.connect(self._on_ingested)
 
-        self._btn_next = QPushButton("Next: map columns")
+        self._btn_transform = QPushButton("Transform to canonical long")
+        self._btn_transform.setEnabled(False)
+        self._btn_transform.clicked.connect(self._run_transform)
+
+        self._btn_next = QPushButton("Next: forecast (Prophet)")
         self._btn_next.setEnabled(False)
-        self._btn_next.clicked.connect(self._not_implemented_yet)
+        self._btn_next.clicked.connect(self._forecast_not_ready)
 
         self._btn_quit = QPushButton("Quit")
         self._btn_quit.clicked.connect(self.close)
@@ -87,6 +120,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._file_picker)
         layout.addWidget(self._ingest_info)
         layout.addWidget(self._profile_info)
+        layout.addWidget(self._column_mapper)
+        layout.addWidget(self._key_builder)
+        layout.addWidget(self._btn_transform)
+        layout.addWidget(self._transform_info)
         layout.addWidget(QLabel("<b>Preview</b>"))
         layout.addWidget(self._preview)
         layout.addWidget(self._btn_next)
@@ -100,9 +137,19 @@ class MainWindow(QMainWindow):
         log.info("main_window_ready", extra={"outputs_dir": str(self._paths.outputs_dir)})
 
         self._last_ingested: IngestedData | None = None
+        self._last_mapping: ColumnMapping | None = None
+        self._last_key_sel: KeySelection | None = None
+        self._last_transform_path: Path | None = None
 
     def _on_ingested(self, data: IngestedData) -> None:
         self._last_ingested = data
+        self._last_mapping = None
+        self._last_key_sel = None
+        self._last_transform_path = None
+        self._btn_transform.setEnabled(False)
+        self._btn_next.setEnabled(False)
+        self._transform_info.setText("Transform: (not run)")
+
         cols_preview = ", ".join(data.columns[:12]) + (" ..." if len(data.columns) > 12 else "")
         self._ingest_info.setText(
             f"<b>Loaded:</b> {data.path.name}<br>"
@@ -115,7 +162,10 @@ class MainWindow(QMainWindow):
 
         profile = self._profiling_service.profile(data.columns, data.preview_rows)
         if profile.frequency:
-            freq_txt = f"{profile.frequency.frequency.name} (conf={profile.frequency.confidence:.2f}, medΔ={profile.frequency.median_delta_days})"
+            freq_txt = (
+                f"{profile.frequency.frequency.name} "
+                f"(conf={profile.frequency.confidence:.2f}, medΔ={profile.frequency.median_delta_days})"
+            )
         else:
             freq_txt = "N/A"
 
@@ -129,7 +179,8 @@ class MainWindow(QMainWindow):
             f"{('<i>Note:</i> ' + profile.notes) if profile.notes else ''}"
         )
 
-        self._btn_next.setEnabled(True)
+        self._column_mapper.set_context(columns=data.columns, profile=profile)
+        self._key_builder.set_context(columns=data.columns, preview_rows=data.preview_rows)
 
         log.info(
             "file_ingested",
@@ -144,17 +195,77 @@ class MainWindow(QMainWindow):
             },
         )
 
-    def _not_implemented_yet(self) -> None:
-        if self._last_ingested is None:
-            QMessageBox.information(self, "No file", "Load a file first.")
+    def _on_mapping_changed(self, mapping: ColumnMapping) -> None:
+        self._last_mapping = mapping
+        self._refresh_actions()
+        log.info(
+            "mapping_changed",
+            extra={"shape": mapping.shape, "date_col": mapping.date_col, "value_col": mapping.value_col},
+        )
+
+    def _on_key_selection_changed(self, sel: KeySelection) -> None:
+        self._last_key_sel = sel
+        self._refresh_actions()
+        log.info("key_selection_changed", extra={"key_parts": sel.key_parts, "sep": sel.separator})
+
+    def _refresh_actions(self) -> None:
+        ready_to_transform = (
+            self._last_ingested is not None and self._last_mapping is not None and self._last_key_sel is not None
+        )
+        self._btn_transform.setEnabled(ready_to_transform)
+        self._btn_next.setEnabled(self._last_transform_path is not None)
+
+    def _run_transform(self) -> None:
+        if self._last_ingested is None or self._last_mapping is None or self._last_key_sel is None:
+            QMessageBox.information(self, "Missing step", "Load a file, map columns, and select key columns first.")
             return
 
+        req = TransformRequest(
+            path=self._last_ingested.path,
+            file_type=self._last_ingested.file_type,
+            shape=self._last_mapping.shape,
+            date_col=self._last_mapping.date_col,
+            value_col=self._last_mapping.value_col,
+            key_parts=self._last_key_sel.key_parts,
+            key_separator=self._last_key_sel.separator,
+            out_dir=self._paths.outputs_dir,
+            out_format="parquet",
+        )
+
+        try:
+            self._transform_info.setText("Transform: running…")
+            self.repaint()  # keeps UI from looking frozen for quick jobs
+
+            res = transform_to_canonical_long(req)
+            self._last_transform_path = res.output_path
+            self._transform_info.setText(
+                f"<b>Transform OK</b><br>"
+                f"Output: {res.output_path}<br>"
+                f"Columns: {', '.join(res.canonical_columns)}<br>"
+                f"{('<i>Note:</i> ' + res.notes) if res.notes else ''}"
+            )
+            self._refresh_actions()
+
+            log.info("transform_ui_ok", extra={"out_path": str(res.output_path)})
+        except PyForecastError as exc:
+            self._transform_info.setText("Transform: failed")
+            QMessageBox.warning(self, "Transform failed", str(exc))
+            log.warning("transform_ui_failed", extra={"error": str(exc)})
+        except Exception as exc:
+            self._transform_info.setText("Transform: failed")
+            QMessageBox.critical(self, "Unexpected error", str(exc))
+            log.exception("transform_ui_failed_unexpected", extra={"error": str(exc)})
+
+    def _forecast_not_ready(self) -> None:
+        if self._last_transform_path is None:
+            QMessageBox.information(self, "Not ready", "Run transform first.")
+            return
         QMessageBox.information(
             self,
             "Next step",
-            "Next we will implement:\n"
-            "- wide vs long confirmation / override\n"
-            "- date column selection (combobox)\n"
-            "- value column selection\n"
-            "- cd_key builder (multi-select)\n",
+            "Forecasting is next.\n\nWe will:\n"
+            "- load canonical parquet\n"
+            "- group by cd_key\n"
+            "- train Prophet per series\n"
+            "- export forecast output",
         )
