@@ -16,18 +16,24 @@ from PySide6.QtWidgets import (
 )
 
 from pyforecast.application.services import (
+    ForecastRequest,
+    forecast_prophet,
     IngestService,
     IngestedData,
     ProfilingService,
     TransformRequest,
     transform_to_canonical_long,
 )
+from pyforecast.domain.canonical_schema import CANON
 from pyforecast.domain.errors import PyForecastError
+from pyforecast.domain.timefreq import TimeFrequency
 from pyforecast.infrastructure.logging import get_logger
 from pyforecast.ui.widgets import (
     ColumnMapper,
     ColumnMapping,
     FilePickerButton,
+    ForecastConfig,
+    ForecastPrompt,
     KeyBuilder,
     KeySelection,
     PreviewTable,
@@ -88,6 +94,14 @@ class MainWindow(QMainWindow):
         self._transform_info.setWordWrap(True)
         self._transform_info.setStyleSheet("padding: 10px; border: 1px solid #eee; border-radius: 8px;")
 
+        self._forecast_info = QLabel("Forecast: (not run)")
+        self._forecast_info.setWordWrap(True)
+        self._forecast_info.setStyleSheet("padding: 10px; border: 1px solid #eee; border-radius: 8px;")
+
+        self._forecast_prompt = ForecastPrompt(self)
+        self._forecast_prompt.config_changed.connect(self._on_forecast_cfg_changed)
+
+        self._preview_title = QLabel("<b>Preview</b>")
         self._preview = PreviewTable(self)
         self._preview.setMinimumHeight(240)
 
@@ -107,9 +121,9 @@ class MainWindow(QMainWindow):
         self._btn_transform.setEnabled(False)
         self._btn_transform.clicked.connect(self._run_transform)
 
-        self._btn_next = QPushButton("Next: forecast (Prophet)")
-        self._btn_next.setEnabled(False)
-        self._btn_next.clicked.connect(self._forecast_not_ready)
+        self._btn_forecast = QPushButton("Run forecast (Prophet)")
+        self._btn_forecast.setEnabled(False)
+        self._btn_forecast.clicked.connect(self._run_forecast)
 
         self._btn_quit = QPushButton("Quit")
         self._btn_quit.clicked.connect(self.close)
@@ -124,9 +138,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._key_builder)
         layout.addWidget(self._btn_transform)
         layout.addWidget(self._transform_info)
-        layout.addWidget(QLabel("<b>Preview</b>"))
+        layout.addWidget(self._forecast_prompt)
+        layout.addWidget(self._btn_forecast)
+        layout.addWidget(self._forecast_info)
+        layout.addWidget(self._preview_title)
         layout.addWidget(self._preview)
-        layout.addWidget(self._btn_next)
         layout.addWidget(self._btn_quit)
         layout.addStretch(1)
 
@@ -134,21 +150,28 @@ class MainWindow(QMainWindow):
         sb.showMessage(f"Outputs: {self._paths.outputs_dir}")
         self.setStatusBar(sb)
 
-        log.info("main_window_ready", extra={"outputs_dir": str(self._paths.outputs_dir)})
-
         self._last_ingested: IngestedData | None = None
         self._last_mapping: ColumnMapping | None = None
         self._last_key_sel: KeySelection | None = None
         self._last_transform_path: Path | None = None
+        self._last_profile_freq: TimeFrequency | None = None
+        self._last_history_points: int | None = None
+        self._last_forecast_cfg: ForecastConfig = ForecastConfig(enabled=False, horizon=12)
 
     def _on_ingested(self, data: IngestedData) -> None:
         self._last_ingested = data
         self._last_mapping = None
         self._last_key_sel = None
         self._last_transform_path = None
+        self._last_profile_freq = None
+        self._last_history_points = None
+
         self._btn_transform.setEnabled(False)
-        self._btn_next.setEnabled(False)
+        self._btn_forecast.setEnabled(False)
+
         self._transform_info.setText("Transform: (not run)")
+        self._forecast_info.setText("Forecast: (not run)")
+        self._forecast_prompt.set_context(frequency=None, n_points=None)
 
         cols_preview = ", ".join(data.columns[:12]) + (" ..." if len(data.columns) > 12 else "")
         self._ingest_info.setText(
@@ -158,9 +181,13 @@ class MainWindow(QMainWindow):
             f"<b>Preview:</b> {len(data.preview_rows)} rows<br>"
             f"<b>First columns:</b> {cols_preview}"
         )
+
+        self._preview_title.setText("<b>Preview</b> (raw input)")
         self._preview.set_preview_rows(data.preview_rows)
 
         profile = self._profiling_service.profile(data.columns, data.preview_rows)
+        self._last_profile_freq = profile.frequency.frequency if profile.frequency else None
+
         if profile.frequency:
             freq_txt = (
                 f"{profile.frequency.frequency.name} "
@@ -182,38 +209,66 @@ class MainWindow(QMainWindow):
         self._column_mapper.set_context(columns=data.columns, profile=profile)
         self._key_builder.set_context(columns=data.columns, preview_rows=data.preview_rows)
 
-        log.info(
-            "file_ingested",
-            extra={
-                "path": str(data.path),
-                "file_type": data.file_type,
-                "n_cols": len(data.columns),
-                "shape": profile.shape,
-                "date_col": profile.inferred_date_column,
-                "freq": (profile.frequency.frequency.value if profile.frequency else None),
-                "freq_conf": (profile.frequency.confidence if profile.frequency else None),
-            },
+        # Enable forecast prompt immediately if we have frequency (even before transform).
+        # Horizon recommendation will become smarter after transform (when we know n_points).
+        self._forecast_prompt.set_context(
+            frequency=self._last_profile_freq,
+            n_points=None,
         )
+
+        self._refresh_actions()
 
     def _on_mapping_changed(self, mapping: ColumnMapping) -> None:
         self._last_mapping = mapping
         self._refresh_actions()
-        log.info(
-            "mapping_changed",
-            extra={"shape": mapping.shape, "date_col": mapping.date_col, "value_col": mapping.value_col},
-        )
 
     def _on_key_selection_changed(self, sel: KeySelection) -> None:
         self._last_key_sel = sel
         self._refresh_actions()
-        log.info("key_selection_changed", extra={"key_parts": sel.key_parts, "sep": sel.separator})
+
+    def _on_forecast_cfg_changed(self, cfg: ForecastConfig) -> None:
+        self._last_forecast_cfg = cfg
+        self._refresh_actions()
 
     def _refresh_actions(self) -> None:
         ready_to_transform = (
             self._last_ingested is not None and self._last_mapping is not None and self._last_key_sel is not None
         )
         self._btn_transform.setEnabled(ready_to_transform)
-        self._btn_next.setEnabled(self._last_transform_path is not None)
+
+        ready_to_forecast = (
+            self._last_transform_path is not None
+            and self._last_profile_freq is not None
+            and self._last_forecast_cfg.enabled
+            and self._last_forecast_cfg.horizon >= 1
+        )
+        self._btn_forecast.setEnabled(ready_to_forecast)
+
+    def _load_canonical_preview(self, parquet_path: Path, n: int = 200) -> list[dict[str, object]]:
+        try:
+            import polars as pl
+        except Exception as exc:
+            raise PyForecastError(
+                "Polars is required to preview canonical output. Install with: pip install -e '.[data]'"
+            ) from exc
+
+        df = pl.read_parquet(parquet_path).head(n)
+        return df.to_dicts()
+
+    def _count_unique_dates(self, parquet_path: Path) -> int:
+        try:
+            import polars as pl
+        except Exception as exc:
+            raise PyForecastError(
+                "Polars is required to analyse canonical output. Install with: pip install -e '.[data]'"
+            ) from exc
+
+        df = (
+            pl.scan_parquet(parquet_path)
+            .select(pl.col(CANON.ds).n_unique().alias("n_dates"))
+            .collect()
+        )
+        return int(df["n_dates"][0])
 
     def _run_transform(self) -> None:
         if self._last_ingested is None or self._last_mapping is None or self._last_key_sel is None:
@@ -234,38 +289,73 @@ class MainWindow(QMainWindow):
 
         try:
             self._transform_info.setText("Transform: running…")
-            self.repaint()  # keeps UI from looking frozen for quick jobs
+            self.repaint()
 
             res = transform_to_canonical_long(req)
             self._last_transform_path = res.output_path
+
+            canonical_rows = self._load_canonical_preview(res.output_path, n=200)
+            self._preview_title.setText("<b>Preview</b> (canonical output: cd_key, ds, y)")
+            self._preview.set_preview_rows(canonical_rows)
+
+            # Now we can drive the smart horizon recommendation from real history depth
+            self._last_history_points = self._count_unique_dates(res.output_path)
+            self._forecast_prompt.set_context(
+                frequency=self._last_profile_freq,
+                n_points=self._last_history_points,
+            )
+
+            freq_txt = self._last_profile_freq.name if self._last_profile_freq else "N/A"
             self._transform_info.setText(
                 f"<b>Transform OK</b><br>"
                 f"Output: {res.output_path}<br>"
                 f"Columns: {', '.join(res.canonical_columns)}<br>"
+                f"History points (unique ds): {self._last_history_points}<br>"
+                f"Frequency: {freq_txt}<br>"
                 f"{('<i>Note:</i> ' + res.notes) if res.notes else ''}"
             )
-            self._refresh_actions()
 
-            log.info("transform_ui_ok", extra={"out_path": str(res.output_path)})
+            self._refresh_actions()
         except PyForecastError as exc:
             self._transform_info.setText("Transform: failed")
             QMessageBox.warning(self, "Transform failed", str(exc))
-            log.warning("transform_ui_failed", extra={"error": str(exc)})
         except Exception as exc:
             self._transform_info.setText("Transform: failed")
             QMessageBox.critical(self, "Unexpected error", str(exc))
-            log.exception("transform_ui_failed_unexpected", extra={"error": str(exc)})
 
-    def _forecast_not_ready(self) -> None:
+    def _run_forecast(self) -> None:
         if self._last_transform_path is None:
             QMessageBox.information(self, "Not ready", "Run transform first.")
             return
-        QMessageBox.information(
-            self,
-            "Next step",
-            "Forecasting is next.\n\nWe will:\n"
-            "- load canonical parquet\n"
-            "- group by cd_key\n"
-            "- train Prophet per series\n"
-            "- export forecast output",
+        if self._last_profile_freq is None:
+            QMessageBox.information(self, "Not ready", "Frequency is unknown; cannot configure Prophet cadence.")
+            return
+        if not self._last_forecast_cfg.enabled:
+            QMessageBox.information(self, "Not ready", "Enable forecasting first.")
+            return
+
+        req = ForecastRequest(
+            canonical_path=self._last_transform_path,
+            frequency=self._last_profile_freq,
+            horizon=self._last_forecast_cfg.horizon,
+            out_dir=self._paths.outputs_dir,
         )
+
+        try:
+            self._forecast_info.setText("Forecast: running…")
+            self.repaint()
+
+            res = forecast_prophet(req)
+            self._forecast_info.setText(
+                f"<b>Forecast OK</b><br>"
+                f"Output dir: {res.output_dir}<br>"
+                f"Series files: {len(res.series_forecast_files)}<br>"
+                f"Skipped series: {res.skipped_series}<br>"
+                f"{('<i>Note:</i> ' + res.notes) if res.notes else ''}"
+            )
+        except PyForecastError as exc:
+            self._forecast_info.setText("Forecast: failed")
+            QMessageBox.warning(self, "Forecast failed", str(exc))
+        except Exception as exc:
+            self._forecast_info.setText("Forecast: failed")
+            QMessageBox.critical(self, "Unexpected error", str(exc))

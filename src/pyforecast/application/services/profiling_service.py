@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Iterable
+from typing import Iterable
 
-from pyforecast.domain.errors import DateInferenceError, SchemaInferenceError
-from pyforecast.domain.timefreq import FrequencyResult, infer_frequency
+from pyforecast.domain.timefreq import FrequencyResult, TimeFrequency, infer_frequency
 from pyforecast.infrastructure.logging import get_logger
 
 log = get_logger(__name__)
@@ -13,149 +12,191 @@ log = get_logger(__name__)
 
 @dataclass(frozen=True)
 class ProfileResult:
-    shape: str  # "long" | "wide" | "unknown"
+    shape: str  # "long" | "wide"
     date_candidates: list[str]
     inferred_date_column: str | None
     frequency: FrequencyResult | None
     notes: str | None = None
 
 
-def _looks_like_date(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, (date, datetime)):
-        return True
-    if isinstance(value, str):
-        s = value.strip()
-        if not s:
-            return False
-        
-        return any(ch.isdigit() for ch in s) and any(sep in s for sep in ("/", "-", ".", " "))
-    return False
-
-
-def _try_parse_date(value: Any) -> date | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    if isinstance(value, str):
-        s = value.strip()
-        if not s:
-            return None
-        
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%d-%m-%Y", "%m-%d-%Y"):
-            try:
-                return datetime.strptime(s[:10], fmt).date()
-            except Exception:
-                continue
-    return None
-
-
-def _non_null_values(rows: Iterable[dict[str, Any]], col: str, limit: int = 200) -> list[Any]:
-    out: list[Any] = []
-    for r in rows:
-        if col in r and r[col] is not None and str(r[col]).strip() != "":
-            out.append(r[col])
-        if len(out) >= limit:
-            break
-    return out
+def require_frequency(profile: ProfileResult) -> FrequencyResult:
+    if profile.frequency is None:
+        raise ValueError("Frequency is not available in the profile.")
+    return profile.frequency
 
 
 class ProfilingService:
+    """
+    Profiles a dataset from preview-only data.
+
+    Key improvement:
+    - If the dataset looks WIDE and dates appear in headers, infer frequency from header dates.
+    """
 
     def __init__(self, sample_limit: int = 200) -> None:
-        self._sample_limit = max(50, sample_limit)
+        self._sample_limit = sample_limit
 
     def profile(self, columns: list[str], preview_rows: list[dict[str, object]]) -> ProfileResult:
-        if not columns:
-            raise SchemaInferenceError("No columns detected.")
+        shape = self._infer_shape(columns, preview_rows)
 
         date_candidates = self._find_date_candidates(columns, preview_rows)
-        inferred_date = date_candidates[0] if date_candidates else None
+        inferred_date_col = date_candidates[0] if date_candidates else None
 
         freq: FrequencyResult | None = None
         notes: str | None = None
 
-        if inferred_date is not None:
-            parsed = self._parse_dates(preview_rows, inferred_date)
-            if len(parsed) >= 3:
-                freq = infer_frequency(parsed)
-            else:
-                notes = f"Could not parse enough dates from '{inferred_date}' (parsed={len(parsed)})."
-        else:
-            notes = "No date column candidate found."
+        # LONG: infer from date column values (existing behaviour)
+        if shape == "long" and inferred_date_col:
+            dates = self._extract_dates_from_rows(preview_rows, inferred_date_col)
+            if len(dates) >= 3:
+                freq = infer_frequency(dates)
 
-        shape = self._infer_shape(columns, preview_rows, inferred_date)
-
-        log.info(
-            "profile_done",
-            extra={
-                "shape": shape,
-                "date_candidates": date_candidates[:5],
-                "inferred_date": inferred_date,
-                "freq": (freq.frequency.value if freq else None),
-                "freq_conf": (freq.confidence if freq else None),
-            },
-        )
+        # WIDE: if we can't reliably infer from a date column, try parsing header dates
+        if shape == "wide" and (freq is None):
+            header_dates = self._extract_dates_from_headers(columns)
+            if len(header_dates) >= 3:
+                freq = infer_frequency(header_dates)
+                notes = "Frequency inferred from date-like column headers (wide format)."
 
         return ProfileResult(
             shape=shape,
             date_candidates=date_candidates,
-            inferred_date_column=inferred_date,
+            inferred_date_column=inferred_date_col if shape == "long" else inferred_date_col,
             frequency=freq,
             notes=notes,
         )
 
-    def _find_date_candidates(self, columns: list[str], rows: list[dict[str, object]]) -> list[str]:
-        scored: list[tuple[str, float]] = []
-        for col in columns:
-            vals = _non_null_values(rows, col, limit=self._sample_limit)
-            if not vals:
-                continue
-            
-            looks = sum(1 for v in vals if _looks_like_date(v))
-            ratio = looks / len(vals)
-            header_bonus = 0.15 if any(tok in col.lower() for tok in ("date", "data", "dt", "dia", "mes", "ano")) else 0
-            score = ratio + header_bonus
-            if score >= 0.55:
-                scored.append((col, score))
+    # ---------- shape & candidates ----------
 
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [c for c, _ in scored]
-
-    def _parse_dates(self, rows: list[dict[str, object]], date_col: str) -> list[date]:
-        vals = _non_null_values(rows, date_col, limit=self._sample_limit)
-        parsed: list[date] = []
-        for v in vals:
-            d = _try_parse_date(v)
-            if d is not None:
-                parsed.append(d)
-        return parsed
-
-    def _infer_shape(
-        self,
-        columns: list[str],
-        rows: list[dict[str, object]],
-        inferred_date_col: str | None,
-    ) -> str:
-
-        if not rows:
-            return "unknown"
-
-        header_dateish = sum(1 for c in columns if _looks_like_date(c))
-        if header_dateish >= max(6, int(0.35 * len(columns))):
+    def _infer_shape(self, columns: list[str], preview_rows: list[dict[str, object]]) -> str:
+        """
+        Heuristic:
+        - If we have a clear date column candidate AND a clear value-like column candidate => long
+        - Otherwise assume wide (common: many period columns).
+        """
+        # If many columns and many look date-like in header, it's probably wide.
+        header_dates = self._extract_dates_from_headers(columns)
+        if len(header_dates) >= 3:
             return "wide"
 
-        if inferred_date_col and len(columns) <= 15:
-            return "long"
+        # Fallback: look for a date column in data values
+        date_cands = self._find_date_candidates(columns, preview_rows)
+        return "long" if date_cands else "wide"
 
-        return "unknown"
+    def _find_date_candidates(self, columns: list[str], preview_rows: list[dict[str, object]]) -> list[str]:
+        """
+        Return columns that look like they contain date values.
+        Conservative: only returns candidates that parse in at least ~30% of sampled rows.
+        """
+        if not preview_rows:
+            return []
 
+        sample = preview_rows[: self._sample_limit]
+        out: list[str] = []
 
-def require_frequency(profile: ProfileResult) -> FrequencyResult:
-    if profile.frequency is None:
-        raise DateInferenceError(profile.notes or "Could not infer frequency.")
-    return profile.frequency
+        for col in columns:
+            ok = 0
+            seen = 0
+            for r in sample:
+                v = r.get(col)
+                if v is None or (isinstance(v, str) and not v.strip()):
+                    continue
+                seen += 1
+                if self._parse_any_date(v) is not None:
+                    ok += 1
+            if seen >= 6 and ok >= max(3, int(seen * 0.30)):
+                out.append(col)
+
+        return out
+
+    # ---------- date extraction ----------
+
+    def _extract_dates_from_rows(self, rows: list[dict[str, object]], date_col: str) -> list[date]:
+        sample = rows[: self._sample_limit]
+        dates: list[date] = []
+        for r in sample:
+            d = self._parse_any_date(r.get(date_col))
+            if d is not None:
+                dates.append(d)
+        # unique + sorted
+        return sorted(set(dates))
+
+    def _extract_dates_from_headers(self, columns: Iterable[str]) -> list[date]:
+        dates: list[date] = []
+        for c in columns:
+            d = self._parse_header_date(str(c))
+            if d is not None:
+                dates.append(d)
+        return sorted(set(dates))
+
+    # ---------- parsing ----------
+
+    _HEADER_DATE_FORMATS = (
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%Y%m%d",
+        "%Y-%m",
+        "%Y/%m",
+        "%Y%m",
+        "%b-%Y",  # Jan-2024
+        "%b/%Y",
+        "%Y-%b",
+    )
+
+    def _parse_header_date(self, s: str) -> date | None:
+        """
+        Parse dates from header labels.
+        Supports common monthly headers (YYYY-MM, YYYYMM) by mapping to day=1.
+        """
+        s = s.strip()
+        if not s:
+            return None
+
+        for fmt in self._HEADER_DATE_FORMATS:
+            try:
+                dt = datetime.strptime(s, fmt)
+                # If format lacks day, strptime sets day=1 already
+                return dt.date()
+            except ValueError:
+                continue
+
+        return None
+
+    def _parse_any_date(self, v: object) -> date | None:
+        """
+        Parse date from cell values.
+        Handles:
+        - python date/datetime
+        - strings in common formats
+        - Excel serials (best-effort)
+        """
+        if v is None:
+            return None
+        if isinstance(v, datetime):
+            return v.date()
+        if isinstance(v, date):
+            return v
+
+        # Excel serial date (common): days since 1899-12-30
+        if isinstance(v, (int, float)):
+            iv = int(v)
+            if 20_000 <= iv <= 80_000:
+                base = date(1899, 12, 30)
+                try:
+                    return base.fromordinal(base.toordinal() + iv)
+                except Exception:
+                    return None
+
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            for fmt in self._HEADER_DATE_FORMATS:
+                try:
+                    return datetime.strptime(s, fmt).date()
+                except ValueError:
+                    continue
+
+        return None

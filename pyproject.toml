@@ -23,6 +23,7 @@ dependencies = [
 data = [
   "polars>=0.20.30",
   "duckdb>=1.0.0",
+  "pyarrow"
 ]
 
 excel = [

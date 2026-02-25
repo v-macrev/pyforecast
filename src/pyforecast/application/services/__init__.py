@@ -1,3 +1,8 @@
+from pyforecast.application.services.forecast_service import (
+    ForecastRequest,
+    ForecastResult,
+    forecast_prophet,
+)
 from pyforecast.application.services.ingest_service import IngestService, IngestedData
 from pyforecast.application.services.key_service import (
     KeySpec,
@@ -29,4 +34,7 @@ __all__ = [
     "TransformRequest",
     "TransformResult",
     "transform_to_canonical_long",
+    "ForecastRequest",
+    "ForecastResult",
+    "forecast_prophet",
 ]
