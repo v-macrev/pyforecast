@@ -5,46 +5,35 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from pyforecast.infrastructure.logging import configure_logging, get_logger
+from pyforecast.application.services.config_service import AppConfig, ConfigService
+from pyforecast.infrastructure.logging import get_logger, init_logging
 from pyforecast.ui.main_window import MainWindow
 
 
-def _set_app_metadata(app: QApplication) -> None:
-    app.setApplicationName("PyForecast")
-    app.setOrganizationName("Macrev")
-    app.setOrganizationDomain("local")
-    app.setApplicationDisplayName("PyForecast")
+def main() -> int:
+    cfg_svc = ConfigService()
+    cfg: AppConfig = cfg_svc.load()
 
+    base_dir: Path = cfg_svc.base_dir
+    output_dir: Path = cfg_svc.resolve_output_dir(cfg)
+    logs_dir: Path = cfg_svc.logs_dir
+    cfg_svc.ensure_dirs(output_dir)
 
-def _ensure_app_dirs() -> Path:
-    base = Path.home() / ".pyforecast"
-    (base / "logs").mkdir(parents=True, exist_ok=True)
-    (base / "outputs").mkdir(parents=True, exist_ok=True)
-    return base
-
-
-def main(argv: list[str] | None = None) -> int:
-    argv = argv if argv is not None else sys.argv
-    app = QApplication(argv)
-    _set_app_metadata(app)
-
-    base_dir = _ensure_app_dirs()
-    configure_logging(log_dir=base_dir / "logs")
+    init_logging(logs_dir=logs_dir)
     log = get_logger(__name__)
-    log.info("app_start", extra={"base_dir": str(base_dir)})
+    log.info("app_start", extra={"base_dir": str(base_dir), "output_dir": str(output_dir), "logs_dir": str(logs_dir)})
+
+    app = QApplication(sys.argv)
 
     try:
-        window = MainWindow(base_dir=base_dir)
+        # ✅ IMPORTANT: PySide/Shiboken does not accept unknown keyword args on QObject/QWidget subclasses
+        window = MainWindow(base_dir)  # positional, not MainWindow(base_dir=...)
+        window.set_output_dir(output_dir)
         window.show()
         return app.exec()
     except Exception as exc:
         log.exception("fatal_error", extra={"error": str(exc)})
-        QMessageBox.critical(
-            None,
-            "Fatal error",
-            f"An unexpected error occurred.\n\n{exc}\n\n"
-            f"Check logs at: {base_dir / 'logs'}",
-        )
+        QMessageBox.critical(None, "PyForecast - Fatal Error", str(exc))
         return 1
 
 

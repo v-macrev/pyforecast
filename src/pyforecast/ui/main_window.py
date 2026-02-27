@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QFileDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QScrollArea,
     QStatusBar,
     QVBoxLayout,
@@ -17,17 +22,16 @@ from PySide6.QtWidgets import (
 
 from pyforecast.application.services import (
     ForecastRequest,
-    forecast_prophet,
     IngestService,
     IngestedData,
     ProfilingService,
     TransformRequest,
-    transform_to_canonical_long,
 )
+from pyforecast.application.services.config_service import AppConfig, ConfigService
 from pyforecast.domain.canonical_schema import CANON
-from pyforecast.domain.errors import PyForecastError
 from pyforecast.domain.timefreq import TimeFrequency
 from pyforecast.infrastructure.logging import get_logger
+from pyforecast.ui.workers import ThreadHandle, start_forecast_thread, start_transform_thread
 from pyforecast.ui.widgets import (
     ColumnMapper,
     ColumnMapping,
@@ -52,11 +56,16 @@ class AppPaths:
 class MainWindow(QMainWindow):
     def __init__(self, base_dir: Path) -> None:
         super().__init__()
+
+        self._cfg_svc = ConfigService(base_dir=base_dir)
+        self._cfg = self._cfg_svc.load()
+
         self._paths = AppPaths(
             base_dir=base_dir,
-            outputs_dir=base_dir / "outputs",
-            logs_dir=base_dir / "logs",
+            outputs_dir=self._cfg_svc.resolve_output_dir(self._cfg),
+            logs_dir=self._cfg_svc.logs_dir,
         )
+        self._cfg_svc.ensure_dirs(self._paths.outputs_dir)
 
         self.setWindowTitle("PyForecast")
         self.setMinimumSize(980, 720)
@@ -82,6 +91,17 @@ class MainWindow(QMainWindow):
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet("color: #666;")
 
+        # Output folder controls
+        self._lbl_output = QLabel("")
+        self._lbl_output.setWordWrap(True)
+        self._lbl_output.setStyleSheet("padding: 8px; border: 1px solid #eee; border-radius: 8px;")
+
+        self._btn_change_output = QPushButton("Change output folder")
+        self._btn_change_output.clicked.connect(self._choose_output_dir)
+
+        self._btn_open_output = QPushButton("Open output folder")
+        self._btn_open_output.clicked.connect(self._open_output_dir)
+
         self._ingest_info = QLabel("No file loaded.")
         self._ingest_info.setWordWrap(True)
         self._ingest_info.setStyleSheet("padding: 10px; border: 1px solid #ddd; border-radius: 8px;")
@@ -97,6 +117,21 @@ class MainWindow(QMainWindow):
         self._forecast_info = QLabel("Forecast: (not run)")
         self._forecast_info.setWordWrap(True)
         self._forecast_info.setStyleSheet("padding: 10px; border: 1px solid #eee; border-radius: 8px;")
+
+        self._progress = QProgressBar(self)
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setVisible(False)
+
+        self._progress_label = QLabel("")
+        self._progress_label.setWordWrap(True)
+        self._progress_label.setVisible(False)
+        self._progress_label.setStyleSheet("color: #444;")
+
+        self._btn_cancel = QPushButton("Cancel current task")
+        self._btn_cancel.setEnabled(False)
+        self._btn_cancel.setVisible(False)
+        self._btn_cancel.clicked.connect(self._cancel_current_task)
 
         self._forecast_prompt = ForecastPrompt(self)
         self._forecast_prompt.config_changed.connect(self._on_forecast_cfg_changed)
@@ -130,12 +165,23 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(title)
         layout.addWidget(subtitle)
+
+        layout.addWidget(QLabel("<b>Output location</b>"))
+        layout.addWidget(self._lbl_output)
+        layout.addWidget(self._btn_change_output)
+        layout.addWidget(self._btn_open_output)
+
         layout.addSpacing(8)
         layout.addWidget(self._file_picker)
         layout.addWidget(self._ingest_info)
         layout.addWidget(self._profile_info)
         layout.addWidget(self._column_mapper)
         layout.addWidget(self._key_builder)
+
+        layout.addWidget(self._progress)
+        layout.addWidget(self._progress_label)
+        layout.addWidget(self._btn_cancel)
+
         layout.addWidget(self._btn_transform)
         layout.addWidget(self._transform_info)
         layout.addWidget(self._forecast_prompt)
@@ -147,8 +193,8 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
 
         sb = QStatusBar(self)
-        sb.showMessage(f"Outputs: {self._paths.outputs_dir}")
         self.setStatusBar(sb)
+        self._refresh_output_label()
 
         self._last_ingested: IngestedData | None = None
         self._last_mapping: ColumnMapping | None = None
@@ -158,6 +204,93 @@ class MainWindow(QMainWindow):
         self._last_history_points: int | None = None
         self._last_forecast_cfg: ForecastConfig = ForecastConfig(enabled=False, horizon=12)
 
+        self._current_task: ThreadHandle | None = None
+        self._current_task_kind: str | None = None
+
+        self._last_forecast_out_dir: Path | None = None
+
+    def set_output_dir(self, output_dir: Path) -> None:
+        output_dir = Path(output_dir)
+        self._paths = AppPaths(self._paths.base_dir, output_dir, self._paths.logs_dir)
+        self._cfg = AppConfig(output_dir=output_dir)
+        self._cfg_svc.save(self._cfg)
+        self._cfg_svc.ensure_dirs(output_dir)
+        self._refresh_output_label()
+
+    def _refresh_output_label(self) -> None:
+        self._lbl_output.setText(str(self._paths.outputs_dir))
+        self.statusBar().showMessage(f"Outputs: {self._paths.outputs_dir}")
+
+    def _choose_output_dir(self) -> None:
+        if self._current_task is not None and self._current_task.is_running():
+            QMessageBox.information(self, "Busy", "Wait for the current task to finish or cancel it first.")
+            return
+
+        start_dir = str(self._paths.outputs_dir)
+        chosen = QFileDialog.getExistingDirectory(self, "Select Output Folder", start_dir)
+        if not chosen:
+            return
+
+        out = Path(chosen)
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            QMessageBox.warning(self, "Invalid folder", f"Could not use this folder:\n{exc}")
+            return
+
+        self.set_output_dir(out)
+
+    def _open_output_dir(self) -> None:
+        path = self._paths.outputs_dir
+        try:
+            if os.name == "nt":
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(path)], check=False)
+            else:
+                subprocess.run(["xdg-open", str(path)], check=False)
+        except Exception as exc:
+            QMessageBox.warning(self, "Cannot open folder", str(exc))
+
+    def _set_busy(self, kind: str, msg: str) -> None:
+        self._current_task_kind = kind
+        self._progress.setVisible(True)
+        self._progress_label.setVisible(True)
+        self._btn_cancel.setVisible(True)
+        self._btn_cancel.setEnabled(True)
+
+        self._progress.setValue(0)
+        self._progress_label.setText(msg)
+
+        self._file_picker.setEnabled(False)
+        self._btn_transform.setEnabled(False)
+        self._btn_forecast.setEnabled(False)
+        self._btn_change_output.setEnabled(False)
+
+    def _clear_busy(self) -> None:
+        self._current_task_kind = None
+        self._current_task = None
+
+        self._progress.setVisible(False)
+        self._progress_label.setVisible(False)
+        self._btn_cancel.setVisible(False)
+        self._btn_cancel.setEnabled(False)
+
+        self._file_picker.setEnabled(True)
+        self._btn_change_output.setEnabled(True)
+        self._refresh_actions()
+
+    def _cancel_current_task(self) -> None:
+        if self._current_task is None or not self._current_task.is_running():
+            return
+        self._btn_cancel.setEnabled(False)
+        self._progress_label.setText("Cancellation requested…")
+        self._current_task.cancel()
+
+    def _on_task_progress(self, pct: int, msg: str) -> None:
+        self._progress.setValue(pct)
+        self._progress_label.setText(msg)
+
     def _on_ingested(self, data: IngestedData) -> None:
         self._last_ingested = data
         self._last_mapping = None
@@ -165,9 +298,7 @@ class MainWindow(QMainWindow):
         self._last_transform_path = None
         self._last_profile_freq = None
         self._last_history_points = None
-
-        self._btn_transform.setEnabled(False)
-        self._btn_forecast.setEnabled(False)
+        self._last_forecast_out_dir = None
 
         self._transform_info.setText("Transform: (not run)")
         self._forecast_info.setText("Forecast: (not run)")
@@ -209,13 +340,7 @@ class MainWindow(QMainWindow):
         self._column_mapper.set_context(columns=data.columns, profile=profile)
         self._key_builder.set_context(columns=data.columns, preview_rows=data.preview_rows)
 
-        # Enable forecast prompt immediately if we have frequency (even before transform).
-        # Horizon recommendation will become smarter after transform (when we know n_points).
-        self._forecast_prompt.set_context(
-            frequency=self._last_profile_freq,
-            n_points=None,
-        )
-
+        self._forecast_prompt.set_context(frequency=self._last_profile_freq, n_points=None)
         self._refresh_actions()
 
     def _on_mapping_changed(self, mapping: ColumnMapping) -> None:
@@ -231,6 +356,9 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
 
     def _refresh_actions(self) -> None:
+        if self._current_task is not None and self._current_task.is_running():
+            return
+
         ready_to_transform = (
             self._last_ingested is not None and self._last_mapping is not None and self._last_key_sel is not None
         )
@@ -243,32 +371,6 @@ class MainWindow(QMainWindow):
             and self._last_forecast_cfg.horizon >= 1
         )
         self._btn_forecast.setEnabled(ready_to_forecast)
-
-    def _load_canonical_preview(self, parquet_path: Path, n: int = 200) -> list[dict[str, object]]:
-        try:
-            import polars as pl
-        except Exception as exc:
-            raise PyForecastError(
-                "Polars is required to preview canonical output. Install with: pip install -e '.[data]'"
-            ) from exc
-
-        df = pl.read_parquet(parquet_path).head(n)
-        return df.to_dicts()
-
-    def _count_unique_dates(self, parquet_path: Path) -> int:
-        try:
-            import polars as pl
-        except Exception as exc:
-            raise PyForecastError(
-                "Polars is required to analyse canonical output. Install with: pip install -e '.[data]'"
-            ) from exc
-
-        df = (
-            pl.scan_parquet(parquet_path)
-            .select(pl.col(CANON.ds).n_unique().alias("n_dates"))
-            .collect()
-        )
-        return int(df["n_dates"][0])
 
     def _run_transform(self) -> None:
         if self._last_ingested is None or self._last_mapping is None or self._last_key_sel is None:
@@ -287,41 +389,68 @@ class MainWindow(QMainWindow):
             out_format="parquet",
         )
 
+        self._set_busy("transform", "Starting transform…")
+
+        handle = start_transform_thread(req)
+        self._current_task = handle
+
+        handle.runner.progress.connect(self._on_task_progress)
+        handle.runner.failed.connect(self._on_transform_failed)
+        handle.runner.cancelled.connect(self._on_transform_cancelled)
+        handle.runner.finished.connect(self._on_transform_finished)
+
+    def _on_transform_failed(self, message: str) -> None:
+        self._transform_info.setText("Transform: failed")
+        self._clear_busy()
+        QMessageBox.warning(self, "Transform failed", message)
+
+    def _on_transform_cancelled(self) -> None:
+        self._transform_info.setText("Transform: cancelled")
+        self._clear_busy()
+        QMessageBox.information(self, "Cancelled", "Transform was cancelled.")
+
+    def _on_transform_finished(self, res_obj: object) -> None:
+        if not hasattr(res_obj, "output_path"):
+            self._on_transform_failed("Invalid transform result.")
+            return
+
+        out_path = Path(getattr(res_obj, "output_path"))
+        notes = getattr(res_obj, "notes", None)
+        canonical_cols = getattr(res_obj, "canonical_columns", [CANON.cd_key, CANON.ds, CANON.y])
+
+        self._last_transform_path = out_path
+        self._last_forecast_out_dir = None
+
         try:
-            self._transform_info.setText("Transform: running…")
-            self.repaint()
-
-            res = transform_to_canonical_long(req)
-            self._last_transform_path = res.output_path
-
-            canonical_rows = self._load_canonical_preview(res.output_path, n=200)
-            self._preview_title.setText("<b>Preview</b> (canonical output: cd_key, ds, y)")
-            self._preview.set_preview_rows(canonical_rows)
-
-            # Now we can drive the smart horizon recommendation from real history depth
-            self._last_history_points = self._count_unique_dates(res.output_path)
-            self._forecast_prompt.set_context(
-                frequency=self._last_profile_freq,
-                n_points=self._last_history_points,
-            )
-
-            freq_txt = self._last_profile_freq.name if self._last_profile_freq else "N/A"
-            self._transform_info.setText(
-                f"<b>Transform OK</b><br>"
-                f"Output: {res.output_path}<br>"
-                f"Columns: {', '.join(res.canonical_columns)}<br>"
-                f"History points (unique ds): {self._last_history_points}<br>"
-                f"Frequency: {freq_txt}<br>"
-                f"{('<i>Note:</i> ' + res.notes) if res.notes else ''}"
-            )
-
-            self._refresh_actions()
-        except PyForecastError as exc:
-            self._transform_info.setText("Transform: failed")
-            QMessageBox.warning(self, "Transform failed", str(exc))
+            import polars as pl
         except Exception as exc:
-            self._transform_info.setText("Transform: failed")
-            QMessageBox.critical(self, "Unexpected error", str(exc))
+            self._clear_busy()
+            QMessageBox.warning(self, "Preview unavailable", f"Polars not available for preview: {exc}")
+            return
+
+        df_prev = pl.read_parquet(self._last_transform_path).head(200)
+        self._preview_title.setText("<b>Preview</b> (canonical output: cd_key, ds, y)")
+        self._preview.set_preview_rows(df_prev.to_dicts())
+
+        n_dates = (
+            pl.scan_parquet(self._last_transform_path)
+            .select(pl.col(CANON.ds).n_unique().alias("n"))
+            .collect()["n"][0]
+        )
+        self._last_history_points = int(n_dates)
+        self._forecast_prompt.set_context(frequency=self._last_profile_freq, n_points=self._last_history_points)
+
+        freq_txt = self._last_profile_freq.name if self._last_profile_freq else "N/A"
+        self._transform_info.setText(
+            f"<b>Transform OK</b><br>"
+            f"Output: {self._last_transform_path}<br>"
+            f"Columns: {', '.join(canonical_cols)}<br>"
+            f"History points (unique ds): {self._last_history_points}<br>"
+            f"Frequency: {freq_txt}<br>"
+            f"{('<i>Note:</i> ' + notes) if notes else ''}"
+        )
+
+        self._clear_busy()
 
     def _run_forecast(self) -> None:
         if self._last_transform_path is None:
@@ -339,23 +468,78 @@ class MainWindow(QMainWindow):
             frequency=self._last_profile_freq,
             horizon=self._last_forecast_cfg.horizon,
             out_dir=self._paths.outputs_dir,
+            # exports both csv & parquet by default in forecast_service
+            out_formats=None,
         )
 
-        try:
-            self._forecast_info.setText("Forecast: running…")
-            self.repaint()
+        self._set_busy("forecast", "Starting forecast…")
 
-            res = forecast_prophet(req)
-            self._forecast_info.setText(
-                f"<b>Forecast OK</b><br>"
-                f"Output dir: {res.output_dir}<br>"
-                f"Series files: {len(res.series_forecast_files)}<br>"
-                f"Skipped series: {res.skipped_series}<br>"
-                f"{('<i>Note:</i> ' + res.notes) if res.notes else ''}"
-            )
-        except PyForecastError as exc:
-            self._forecast_info.setText("Forecast: failed")
-            QMessageBox.warning(self, "Forecast failed", str(exc))
-        except Exception as exc:
-            self._forecast_info.setText("Forecast: failed")
-            QMessageBox.critical(self, "Unexpected error", str(exc))
+        handle = start_forecast_thread(req)
+        self._current_task = handle
+
+        handle.runner.progress.connect(self._on_task_progress)
+        handle.runner.failed.connect(self._on_forecast_failed)
+        handle.runner.cancelled.connect(self._on_forecast_cancelled)
+        handle.runner.finished.connect(self._on_forecast_finished)
+
+    def _on_forecast_failed(self, message: str) -> None:
+        self._forecast_info.setText("Forecast: failed")
+        self._clear_busy()
+        QMessageBox.warning(self, "Forecast failed", message)
+
+    def _on_forecast_cancelled(self) -> None:
+        self._forecast_info.setText("Forecast: cancelled")
+        self._clear_busy()
+        QMessageBox.information(self, "Cancelled", "Forecast was cancelled.")
+
+    def _on_forecast_finished(self, res_obj: object) -> None:
+        if not hasattr(res_obj, "output_dir"):
+            self._on_forecast_failed("Invalid forecast result.")
+            return
+
+        out_dir = Path(getattr(res_obj, "output_dir"))
+        series_files = list(getattr(res_obj, "series_forecast_files", []) or [])
+        skipped = int(getattr(res_obj, "skipped_series", 0))
+        notes = getattr(res_obj, "notes", None)
+
+        self._last_forecast_out_dir = out_dir
+
+        # Preview: prefer CSV (user-friendly), fallback to parquet.
+        preview_loaded = False
+        preview_err: str | None = None
+
+        if series_files:
+            csv_first = next((Path(p) for p in series_files if str(p).lower().endswith(".csv")), None)
+            pq_first = next((Path(p) for p in series_files if str(p).lower().endswith(".parquet")), None)
+            chosen = csv_first or pq_first
+
+            if chosen is not None:
+                try:
+                    import polars as pl
+
+                    if chosen.suffix.lower() == ".parquet":
+                        df = pl.read_parquet(chosen).head(200)
+                    else:
+                        df = pl.read_csv(chosen).head(200)
+
+                    self._preview_title.setText(f"<b>Preview</b> (forecast output: {chosen.name})")
+                    self._preview.set_preview_rows(df.to_dicts())
+                    preview_loaded = True
+                except Exception as exc:
+                    preview_err = str(exc)
+
+        self._forecast_info.setText(
+            f"<b>Forecast OK</b><br>"
+            f"Output dir: {out_dir}<br>"
+            f"Series files: {len(series_files)} (CSV + Parquet)<br>"
+            f"Skipped series: {skipped}<br>"
+            f"{('<i>Note:</i> ' + notes) if notes else ''}"
+            f"{'<br><i>Preview:</i> loaded' if preview_loaded else ''}"
+            f"{('<br><i>Preview error:</i> ' + preview_err) if (not preview_loaded and preview_err) else ''}"
+        )
+
+        log.info(
+            "forecast_ui_ok",
+            extra={"out_dir": str(out_dir), "written": len(series_files), "skipped": skipped},
+        )
+        self._clear_busy()

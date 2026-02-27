@@ -2,79 +2,82 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
-from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict
 
+_LOG_INITIALIZED = False
 
-class _JsonFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        payload: dict[str, Any] = {
-            "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-            "level": record.levelname,
-            "logger": record.name,
-            "msg": record.getMessage(),
-        }
+def init_logging(logs_dir: Path) -> None:
+    global _LOG_INITIALIZED
 
-        standard = {
-            "name",
-            "msg",
-            "args",
-            "levelname",
-            "levelno",
-            "pathname",
-            "filename",
-            "module",
-            "exc_info",
-            "exc_text",
-            "stack_info",
-            "lineno",
-            "funcName",
-            "created",
-            "msecs",
-            "relativeCreated",
-            "thread",
-            "threadName",
-            "processName",
-            "process",
-        }
-        extras = {k: v for k, v in record.__dict__.items() if k not in standard}
-        if extras:
-            payload["extra"] = extras
+    if _LOG_INITIALIZED:
+        return
 
-        if record.exc_info:
-            payload["exc_info"] = self.formatException(record.exc_info)
-
-        return json.dumps(payload, ensure_ascii=False)
-
-
-def configure_logging(log_dir: Path, level: int = logging.INFO) -> None:
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "app.jsonl"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_file = logs_dir / "pyforecast.log"
 
     root = logging.getLogger()
-    root.setLevel(level)
+    root.setLevel(logging.INFO)
 
-    for h in list(root.handlers):
-        root.removeHandler(h)
-
-    fmt = _JsonFormatter()
-
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(level)
-    file_handler.setFormatter(fmt)
-
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(level)
-    console_handler.setFormatter(fmt)
-
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=5 * 1024 * 1024,  # 5MB
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(JsonFormatter())
     root.addHandler(file_handler)
+
+    # Console handler (clean readable format)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(
+        logging.Formatter("[%(levelname)s] %(name)s - %(message)s")
+    )
     root.addHandler(console_handler)
 
-    logging.getLogger("asyncio").setLevel(logging.WARNING)
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    _LOG_INITIALIZED = True
 
 
 def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
+
+
+class JsonFormatter(logging.Formatter):
+
+    def format(self, record: logging.LogRecord) -> str:
+        base: Dict[str, Any] = {
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+
+        for key, value in record.__dict__.items():
+            if key not in (
+                "name",
+                "msg",
+                "args",
+                "levelname",
+                "levelno",
+                "pathname",
+                "filename",
+                "module",
+                "exc_info",
+                "exc_text",
+                "stack_info",
+                "lineno",
+                "funcName",
+                "created",
+                "msecs",
+                "relativeCreated",
+                "thread",
+                "threadName",
+                "processName",
+                "process",
+            ):
+                base[key] = value
+
+        if record.exc_info:
+            base["exception"] = self.formatException(record.exc_info)
+
+        return json.dumps(base, ensure_ascii=False)

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 from pyforecast.domain.canonical_schema import CANON
-from pyforecast.domain.errors import ForecastError, TransformationError
+from pyforecast.domain.errors import ForecastError, PyForecastError
 from pyforecast.domain.timefreq import TimeFrequency
 from pyforecast.infrastructure.logging import get_logger
 
@@ -14,26 +13,25 @@ log = get_logger(__name__)
 
 @dataclass(frozen=True)
 class ForecastRequest:
-    """
-    Forecasts a canonical long dataset (cd_key, ds, y).
-
-    Notes on scale:
-    - This implementation writes ONE parquet per series (cd_key) to keep memory bounded.
-    - A later optimisation can batch keys or write a single partitioned dataset.
-    """
-    canonical_path: Path  # parquet produced by transform_service
+    canonical_path: Path
     frequency: TimeFrequency
-    horizon: int  # periods ahead
-    out_dir: Path | None = None
-    max_series: int = 500  # safety guard for desktop
-    min_points: int = 12   # skip very short series
-    prophet_seasonality_mode: str = "additive"  # "additive" | "multiplicative"
+    horizon: int
+    out_dir: Path
+
+    # ✅ New (backwards-compatible): also export CSV
+    # - None => export both parquet + csv
+    # - ("csv",) => only csv
+    # - ("parquet",) => only parquet
+    out_formats: tuple[str, ...] | None = None
+
+    # Series quality gates
+    min_points: int = 10  # skip series with less than this many observations
 
 
 @dataclass(frozen=True)
 class ForecastResult:
     output_dir: Path
-    series_forecast_files: list[Path]
+    series_forecast_files: list[str]
     skipped_series: int
     notes: str | None = None
 
@@ -42,161 +40,173 @@ def _require_polars() -> "pl":  # type: ignore[name-defined]
     try:
         import polars as pl  # type: ignore
     except Exception as exc:
-        raise ForecastError("Polars is required. Install with: pip install -e '.[data]'") from exc
+        raise ForecastError("Polars is required for forecasting. Install with: pip install -e '.[data]'") from exc
     return pl
 
 
-def _require_prophet() -> "Prophet":  # type: ignore[name-defined]
+def _require_prophet():
+    """
+    Tries both 'prophet' and legacy 'fbprophet' import paths.
+    """
     try:
         from prophet import Prophet  # type: ignore
-    except Exception as exc:
-        raise ForecastError("Prophet is required. Install with: pip install -e '.[forecast]'") from exc
-    return Prophet
+        return Prophet
+    except Exception:
+        try:
+            from fbprophet import Prophet  # type: ignore
+            return Prophet
+        except Exception as exc:
+            raise ForecastError("Prophet is required. Install with: pip install -e '.[ml]'") from exc
 
 
-def _freq_to_pandas(freq: TimeFrequency) -> str:
+def _validate_req(req: ForecastRequest) -> None:
+    if not req.canonical_path.exists():
+        raise ForecastError(f"Canonical file not found: {req.canonical_path}")
+
+    if req.horizon < 1:
+        raise ForecastError("Horizon must be >= 1.")
+
+    if not req.out_dir:
+        raise ForecastError("out_dir is required.")
+
+    req.out_dir.mkdir(parents=True, exist_ok=True)
+
+    if req.out_formats is not None:
+        bad = [x for x in req.out_formats if x not in ("parquet", "csv")]
+        if bad:
+            raise ForecastError(f"Invalid out_formats: {bad}. Allowed: parquet, csv")
+
+
+def _prophet_freq(freq: TimeFrequency) -> str:
     """
-    Pandas date_range freq string (Prophet future dataframe cadence).
+    Prophet expects a pandas date_range freq string.
+    We keep it simple and boring.
     """
     if freq == TimeFrequency.DAILY:
         return "D"
     if freq == TimeFrequency.WEEKLY:
         return "W"
     if freq == TimeFrequency.MONTHLY:
-        return "MS"   # month start
+        return "MS"  # month start (consistent spacing)
     if freq == TimeFrequency.QUARTERLY:
-        return "QS"   # quarter start
+        return "QS"  # quarter start
     if freq == TimeFrequency.YEARLY:
-        return "YS"   # year start
-    raise ForecastError(f"Unsupported frequency for forecasting: {freq.name}")
+        return "YS"  # year start
+    # Fallback for IRREGULAR or unknown: daily
+    return "D"
 
 
-def _safe_filename(s: str, max_len: int = 120) -> str:
-    # filesystem-safe, deterministic
-    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in s)
-    return cleaned[:max_len] if len(cleaned) > max_len else cleaned
+def _formats(req: ForecastRequest) -> tuple[str, ...]:
+    return req.out_formats if req.out_formats is not None else ("parquet", "csv")
 
 
-def _default_out_dir(canonical_path: Path, out_dir: Path | None) -> Path:
-    base = out_dir or (Path.home() / ".pyforecast" / "outputs")
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return base / "forecasts" / f"{canonical_path.stem}__{ts}"
+def _series_out_paths(out_dir: Path, cd_key: str, formats: tuple[str, ...]) -> list[Path]:
+    safe = _sanitize_filename(cd_key)
+    paths: list[Path] = []
+    if "parquet" in formats:
+        paths.append(out_dir / f"forecast__{safe}.parquet")
+    if "csv" in formats:
+        paths.append(out_dir / f"forecast__{safe}.csv")
+    return paths
+
+
+def _sanitize_filename(s: str) -> str:
+    # windows-safe-ish
+    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in s)[:180]
 
 
 def forecast_prophet(req: ForecastRequest) -> ForecastResult:
-    if not req.canonical_path.exists():
-        raise TransformationError(f"Canonical dataset not found: {req.canonical_path}")
-    if req.horizon <= 0:
-        raise ForecastError("horizon must be >= 1")
-    if req.max_series <= 0:
-        raise ForecastError("max_series must be >= 1")
-    if req.min_points < 2:
-        raise ForecastError("min_points must be >= 2")
+    """
+    Reads canonical long (cd_key, ds, y) and writes forecast outputs.
 
+    ✅ Exports BOTH parquet and csv by default.
+    - One file per series: forecast__<cd_key>.parquet / .csv
+
+    Output schema per file:
+      cd_key, ds, yhat, yhat_lower, yhat_upper
+    """
+    _validate_req(req)
     pl = _require_polars()
     Prophet = _require_prophet()
-    pd_freq = _freq_to_pandas(req.frequency)
+    freq = _prophet_freq(req.frequency)
+    formats = _formats(req)
 
-    out_dir = _default_out_dir(req.canonical_path, req.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        lf = pl.scan_parquet(req.canonical_path).select([CANON.cd_key, CANON.ds, CANON.y])
 
-    # Load key list (bounded) with lazy scan
-    keys_df = (
-        pl.scan_parquet(req.canonical_path)
-        .select(pl.col(CANON.cd_key))
-        .unique()
-        .limit(req.max_series)
-        .collect()
-    )
-    keys = keys_df[CANON.cd_key].to_list()  # type: ignore[no-any-return]
+        # Collect unique keys (small)
+        keys = lf.select(pl.col(CANON.cd_key).unique()).collect()[CANON.cd_key].to_list()
 
-    if not keys:
-        raise ForecastError("No cd_key values found in canonical dataset.")
+        out_files: list[str] = []
+        skipped = 0
 
-    skipped = 0
-    out_files: list[Path] = []
-
-    log.info(
-        "forecast_start",
-        extra={
-            "canonical_path": str(req.canonical_path),
-            "frequency": req.frequency.value,
-            "horizon": req.horizon,
-            "max_series": req.max_series,
-            "min_points": req.min_points,
-            "out_dir": str(out_dir),
-        },
-    )
-
-    # Iterate series one by one to keep memory bounded
-    for i, key in enumerate(keys, start=1):
-        try:
-            lf = (
-                pl.scan_parquet(req.canonical_path)
-                .filter(pl.col(CANON.cd_key) == key)
-                .select([CANON.ds, CANON.y])
-                .drop_nulls([CANON.ds, CANON.y])
-                .sort(CANON.ds)
+        for k in keys:
+            # Load this series only
+            df_k = (
+                lf.filter(pl.col(CANON.cd_key) == k)
+                .select(
+                    pl.col(CANON.ds).cast(pl.Date, strict=False).alias("ds"),
+                    pl.col(CANON.y).cast(pl.Float64, strict=False).alias("y"),
+                )
+                .drop_nulls(["ds"])
+                .sort("ds")
+                .collect()
             )
 
-            df = lf.collect()
-            if df.height < req.min_points:
+            if df_k.height < req.min_points:
                 skipped += 1
                 continue
 
-            # Prophet wants pandas with ds as datetime64 and y float
-            pdf = df.to_pandas()
-            # ensure datetime
-            pdf[CANON.ds] = pdf[CANON.ds].astype("datetime64[ns]")
+            # Prophet expects pandas with columns ds/y
+            pdf = df_k.to_pandas(use_pyarrow_extension_array=True)  # type: ignore[arg-type]
 
-            m = Prophet(seasonality_mode=req.prophet_seasonality_mode)
-            m.fit(pdf.rename(columns={CANON.ds: "ds", CANON.y: "y"}))
+            m = Prophet()
+            m.fit(pdf)
 
-            future = m.make_future_dataframe(periods=req.horizon, freq=pd_freq, include_history=True)
+            future = m.make_future_dataframe(periods=req.horizon, freq=freq, include_history=False)
             fc = m.predict(future)
 
-            # Standard output columns
-            fc_out = fc[["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
-            fc_out[CANON.cd_key] = key
-            fc_out["run_frequency"] = req.frequency.value
-            fc_out["run_horizon"] = req.horizon
-
-            out_path = out_dir / f"{i:05d}__{_safe_filename(str(key))}.parquet"
-
-            # Write per-series parquet
-            pl.from_pandas(fc_out).write_parquet(out_path)
-            out_files.append(out_path)
-
-            if i % 25 == 0 or i == len(keys):
-                log.info(
-                    "forecast_progress",
-                    extra={"done": i, "total": len(keys), "written": len(out_files), "skipped": skipped},
-                )
-
-        except Exception as exc:
-            skipped += 1
-            log.warning(
-                "forecast_series_failed",
-                extra={"cd_key": str(key), "error": str(exc)},
+            # Keep only minimal useful columns
+            out_pl = pl.from_pandas(fc[["ds", "yhat", "yhat_lower", "yhat_upper"]])  # type: ignore[index]
+            out_pl = out_pl.with_columns(pl.lit(k).alias(CANON.cd_key)).select(
+                [CANON.cd_key, pl.col("ds").cast(pl.Date, strict=False).alias(CANON.ds), "yhat", "yhat_lower", "yhat_upper"]
             )
 
-    notes = (
-        "Outputs are written as one parquet per cd_key to keep memory bounded. "
-        "If you need a single file or partitions, we can add a merge/export step."
-    )
+            # Write all requested formats
+            for p in _series_out_paths(req.out_dir, k, formats):
+                if p.suffix.lower() == ".parquet":
+                    out_pl.write_parquet(p)
+                elif p.suffix.lower() == ".csv":
+                    out_pl.write_csv(p)
+                out_files.append(str(p))
 
-    log.info(
-        "forecast_done",
-        extra={
-            "out_dir": str(out_dir),
-            "written": len(out_files),
-            "skipped": skipped,
-        },
-    )
+        notes = None
+        if req.frequency == TimeFrequency.IRREGULAR:
+            notes = "Input frequency was IRREGULAR; Prophet used daily cadence (freq='D') as a fallback."
 
-    return ForecastResult(
-        output_dir=out_dir,
-        series_forecast_files=out_files,
-        skipped_series=skipped,
-        notes=notes,
-    )
+        log.info(
+            "forecast_ok",
+            extra={
+                "canonical_path": str(req.canonical_path),
+                "out_dir": str(req.out_dir),
+                "formats": list(formats),
+                "series": len(keys),
+                "written_files": len(out_files),
+                "skipped": skipped,
+                "horizon": req.horizon,
+                "freq": freq,
+            },
+        )
+
+        return ForecastResult(
+            output_dir=req.out_dir,
+            series_forecast_files=out_files,
+            skipped_series=skipped,
+            notes=notes,
+        )
+
+    except PyForecastError:
+        raise
+    except Exception as exc:
+        log.exception("forecast_failed", extra={"error": str(exc)})
+        raise ForecastError("Failed to run Prophet forecast.") from exc
