@@ -86,11 +86,7 @@ class PreviewTable(QTableWidget):
         return text
 
     def _auto_resize_columns(self, columns: list[str]) -> None:
-        """
-        Smart column sizing:
-        - Small tables → resize to contents
-        - Wide tables → limit expansion
-        """
+
         header = self.horizontalHeader()
 
         if len(columns) <= 6:
