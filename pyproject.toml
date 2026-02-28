@@ -26,6 +26,10 @@ data = [
   "pyarrow"
 ]
 
+build = [
+  "pyinstaller",
+]
+
 excel = [
   "python-calamine>=0.2.0",
 ]
@@ -37,7 +41,6 @@ forecast = [
 dev = [
   "pytest>=8.0",
   "ruff>=0.9",
-  
   "mypy>=1.18",
   "types-python-dateutil",
 ]

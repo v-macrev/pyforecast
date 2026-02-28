@@ -1,0 +1,53 @@
+name: Release (Windows)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[data,excel,build]"
+
+      - name: Build exe (PyInstaller)
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean PyForecast.spec
+
+      - name: Package artifact (zip)
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $out = "PyForecast-$tag-windows"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item -Recurse -Force "dist\PyForecast\*" $out
+          Compress-Archive -Path "$out\*" -DestinationPath "$out.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PyForecast-windows
+          path: PyForecast-*.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: PyForecast-*.zip
