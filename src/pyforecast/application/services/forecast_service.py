@@ -17,15 +17,9 @@ class ForecastRequest:
     frequency: TimeFrequency
     horizon: int
     out_dir: Path
-
-    # ✅ New (backwards-compatible): also export CSV
-    # - None => export both parquet + csv
-    # - ("csv",) => only csv
-    # - ("parquet",) => only parquet
     out_formats: tuple[str, ...] | None = None
 
-    # Series quality gates
-    min_points: int = 10  # skip series with less than this many observations
+    min_points: int = 10
 
 
 @dataclass(frozen=True)
